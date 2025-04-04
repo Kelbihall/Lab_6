@@ -1,11 +1,176 @@
 ---
-title: "Lab_6"
+title: "Lab 6"
+author: "Kelbi Hall"
+date: "2025-03-01"
+format: html
+execute:
+  echo: true
 ---
 
-This is a Quarto website.
+```{r}
+library(tidyverse)
+library(readxl)
+library(ggthemes)
+library(tidymodels)
+library(vip)
+library(baguette)
+library(glue)
+```
 
-To learn more about Quarto websites visit <https://quarto.org/docs/websites>.
+## Question#1
+
+### What does `zero_q_freq` represent?
+
+The CAMELS dataset doc says that `zero_q_freq` is the fraction of days with zero stream flow over the observational period. So this means it is a measure of how often a stream at a given site runs dry.
 
 ```{r}
-1 + 1
+clim <- read_delim("data/camels_clim.txt", delim = ";")
+geol <- read_delim("data/camels_geol.txt", delim = ";")
+hydro <- read_delim("data/camels_hydro.txt", delim = ";")
+soil <- read_delim("data/camels_soil.txt", delim = ";")
+topo <- read_delim("data/camels_topo.txt", delim = ";")
+vege <- read_delim("data/camels_vege.txt", delim = ";")
+
+camels <- reduce(list(clim, geol, hydro, soil, topo, vege), full_join, by = "gauge_id")
+
+ggplot(data = camels, aes(x = gauge_lon, y = gauge_lat)) +
+  borders("state", colour = "gray50") +
+  geom_point(aes(color = q_mean)) +
+  scale_color_gradient(low = "pink", high = "dodgerblue") +
+  ggthemes::theme_map() +
+  labs(title = "CAMELS Sites Colored by Mean Flow (q_mean)",
+       x = "Longitude", y = "Latitude",
+       color = "Mean Flow")
+
 ```
+
+## Question #2
+
+```{r}
+library(patchwork)
+
+map_p <- ggplot(camels, aes(x = gauge_lon, y = gauge_lat)) +
+  borders("state", colour = "gray60") +
+  geom_point(aes(color = p_mean), size = 2) +
+  scale_color_viridis_c(option = "D") +
+  coord_fixed(1.3) +  # <- this is the fix!
+  ggthemes::theme_map() +
+  labs(title = "Mean Precipitation (p_mean)",
+       color = "mm/day")
+
+map_a <- ggplot(camels, aes(x = gauge_lon, y = gauge_lat)) +
+  borders("state", colour = "gray60") +
+  geom_point(aes(color = aridity), size = 2) +
+  scale_color_viridis_c(option = "C") +
+  coord_fixed(1.3) +  # <- fix here too
+  ggthemes::theme_map() +
+  labs(title = "Aridity Index (PET / P)",
+       color = "Aridity")
+
+map_p + map_a
+
+```
+
+## Model Building
+
+```{r}
+library(tidymodels)
+
+
+camels_mod <- camels %>%
+  select(where(is.numeric)) %>%
+  drop_na()
+
+
+set.seed(330)
+split <- initial_split(camels_mod, prop = 0.8)
+train <- training(split)
+test <- testing(split)
+
+
+rec <- recipe(q_mean ~ ., data = train) %>%
+  step_normalize(all_predictors())
+
+```
+
+```{r}
+lm_mod <- linear_reg() %>% set_engine("lm")
+rf_mod <- rand_forest(mode = "regression") %>% set_engine("ranger")
+xgb_mod <- boost_tree(mode = "regression") %>% set_engine("xgboost")
+
+```
+
+```{r}
+models <- workflow_set(
+  preproc = list(base = rec),
+  models = list(LM = lm_mod, RF = rf_mod, XGB = xgb_mod)
+)
+
+resamples <- vfold_cv(train, v = 5)
+
+
+results <- models %>%
+  workflow_map("fit_resamples", resamples = resamples, metrics = metric_set(rmse, rsq))
+
+```
+
+```{r}
+collect_metrics(results) %>% 
+  select(wflow_id, .metric, mean, std_err)
+```
+
+```{r}
+final_lm <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(lm_mod) %>%
+  fit(data = train)
+
+
+lm_preds <- predict(final_lm, test) %>%
+  bind_cols(test)
+
+metrics(lm_preds, truth = q_mean, estimate = .pred)
+
+
+ggplot(lm_preds, aes(x = q_mean, y = .pred)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Test Set: Predicted vs Observed q_mean (Linear Model)",
+       x = "Observed q_mean",
+       y = "Predicted q_mean")
+
+```
+
+## Question #3
+
+```{r}
+library(baguette)
+
+nn_mod <- bag_mlp(mode = "regression") %>%
+  set_engine("nnet")
+
+```
+
+```{r}
+models_all <- workflow_set(
+  preproc = list(base = rec),
+  models = list(
+    LM = lm_mod,
+    RF = rf_mod,
+    XGB = xgb_mod,
+    NN = nn_mod
+  )
+)
+
+# Fit with cross-validation
+results_all <- models_all %>%
+  workflow_map("fit_resamples", resamples = resamples, metrics = metric_set(rmse, rsq))
+
+```
+
+```{r}
+collect_metrics(results_all) %>%
+  select(wflow_id, .metric, mean, std_err)
+```
+
+After adding a neural net model, I compared linear, RF, XGBoost, and NN. Linear regression still performed the best overall with the lowest RMSE and highest R². The neural net and XGBoost were close behind, but the simplicity and strong performance of the linear model makes it the best choice for this dataset.

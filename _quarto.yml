@@ -1,5 +1,7 @@
 project:
   type: website
+  output-dir: docs
+
 
 website:
   title: "Lab_6"
@@ -8,9 +10,9 @@ website:
       - href: index.qmd
         text: Home
       - about.qmd
-
 format:
   html:
+    self-contained: true
     theme:
       - cosmo
       - brand
