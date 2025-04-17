@@ -1,0 +1,197 @@
+---
+title: "hyperparameter-tuning"
+author: "Kelbi Hall"
+date: "2025-04-16"
+format: html
+execute:
+  echo: true
+---
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(powerjoin)
+library(readxl)
+library(skimr)
+library(visdat)
+library(ggthemes)
+library(patchwork)
+
+data_path <- "~/Desktop/ESS320/Lab_6/data/"
+
+clim  <- read_delim(paste0(data_path, "camels_clim.txt"), delim = ";")
+geol  <- read_delim(paste0(data_path, "camels_geol.txt"), delim = ";")
+hydro <- read_delim(paste0(data_path, "camels_hydro.txt"), delim = ";")
+soil  <- read_delim(paste0(data_path, "camels_soil.txt"), delim = ";")
+topo  <- read_delim(paste0(data_path, "camels_topo.txt"), delim = ";")
+vege  <- read_delim(paste0(data_path, "camels_vege.txt"), delim = ";")
+
+
+```
+
+```{r}
+
+camels <- reduce(
+  list(clim, geol, hydro, soil, topo, vege),
+  power_full_join,
+  by = "gauge_id"
+)
+
+```
+
+```{r}
+
+camels <- reduce(
+  list(clim, geol, hydro, soil, topo, vege),
+  power_full_join,
+  by = "gauge_id"
+)
+
+camels_clean <- camels %>%
+  mutate(dom_land_cover = str_trim(dom_land_cover)) %>%
+  mutate(across(
+    .cols = -c(gauge_id, high_prec_timing, low_prec_timing, geol_1st_class, geol_2nd_class, dom_land_cover),
+    .fns = as.numeric
+  )) %>%
+  filter(!is.na(gauge_lat), !is.na(gauge_lon)) %>%
+  distinct()
+
+camels_model <- camels_clean %>%
+  filter(!is.na(q_mean), !is.infinite(q_mean), q_mean < 1e6) %>%
+  select(where(is.numeric))
+split <- initial_split(camels_model, prop = 0.8)
+
+```
+
+```{r}
+camels_model <- camels_clean %>%
+  filter(
+    !is.na(q_mean),
+    !is.infinite(q_mean),
+    q_mean < 1e6  
+  ) %>%
+  select(where(is.numeric))
+
+```
+
+```{r}
+set.seed(330)
+split <- initial_split(camels_model, prop = 0.8)
+train <- training(split)
+test <- testing(split)
+
+```
+
+```{r}
+rec <- recipe(q_mean ~ ., data = train) %>%
+  step_rm(gauge_lat, gauge_lon) %>%
+  step_impute_mean(all_predictors()) %>%
+  step_normalize(all_predictors())
+```
+
+```{r}
+folds <- vfold_cv(train, v = 10)
+
+lm_mod <- linear_reg() %>% set_engine("lm")
+rf_mod <- rand_forest(mode = "regression") %>% set_engine("ranger")
+xgb_mod <- boost_tree(mode = "regression") %>% set_engine("xgboost")
+
+```
+
+```{r}
+xgb_tune <- boost_tree(
+  mode = "regression",
+  mtry = tune(),
+  trees = tune(),
+  min_n = tune()
+) %>%
+  set_engine("xgboost")
+
+
+wf_tune <- workflow() %>%
+  add_model(xgb_tune) %>%
+  add_recipe(rec)
+
+dials <- extract_parameter_set_dials(wf_tune)
+dials <- finalize(dials, train)
+
+my.grid <- grid_latin_hypercube(dials, size = 25)
+
+model_params <- tune_grid(
+  wf_tune,
+  resamples = folds,
+  grid = my.grid,
+  metrics = metric_set(rmse, rsq, mae),
+  control = control_grid(save_pred = TRUE)
+)
+
+autoplot(model_params)
+
+
+collect_metrics(model_params)
+show_best(model_params, metric = "mae")
+hp_best <- select_best(model_params, metric = "mae")
+
+final_wf <- finalize_workflow(wf_tune, hp_best)
+
+
+```
+
+```{r}
+collect_metrics(model_params)
+show_best(model_params, metric = "mae")
+hp_best <- select_best(model_params, metric = "mae")
+
+final_wf <- finalize_workflow(wf_tune, hp_best)
+```
+
+```{r}
+final_fit <- last_fit(final_wf, split)
+preds <- collect_predictions(final_fit)
+
+ggplot(preds, aes(x = q_mean, y = .pred)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, color = "dodgerblue") +
+  geom_abline(linetype = "dashed", color = "gray30") +
+  labs(
+    x = "Observed q_mean",
+    y = "Predicted q_mean",
+    title = "Final Model: Observed vs Predicted"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+final_model <- fit(final_wf, data = camels_model)
+
+# Predictions for map
+predicted_map <- augment(final_model, camels_clean) %>%
+  mutate(residual = (q_mean - .pred)^2)
+
+# Plot 1: Predicted q_mean
+map_q <- ggplot(predicted_map, aes(x = gauge_lon, y = gauge_lat)) +
+  geom_point(aes(color = .pred), size = 2) +
+  borders("state", colour = "gray70") +
+  scale_color_viridis_c() +
+  ggthemes::theme_map() +
+  labs(title = "Predicted q_mean")
+
+# Plot 2: Residuals
+map_resid <- ggplot(predicted_map, aes(x = gauge_lon, y = gauge_lat)) +
+  geom_point(aes(color = residual), size = 2) +
+  borders("state", colour = "gray70") +
+  scale_color_viridis_c() +
+  ggthemes::theme_map() +
+  labs(title = "Prediction Residuals")
+
+# Combine
+map_q + map_resid
+
+```
+```{r}
+glimpse(preds)
+
+```
+
+
